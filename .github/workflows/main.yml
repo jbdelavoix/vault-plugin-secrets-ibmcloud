@@ -1,0 +1,116 @@
+on:
+  push:
+    branches:
+      - main
+      - feat/upgrade_deps_and_compile
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install dependencies
+        run: |
+          go mod tidy
+          go mod verify
+
+      - name: Run Tests
+        run: go test ./... -v
+
+  build-matrix:
+    name: Build Multi-Platform
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows, darwin]
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Extract Version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Build Binary
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -o vault-plugin-secrets-ibmcloud
+
+      - name: Create Idempotent Zip
+        run: |
+          BINARY=vault-plugin-secrets-ibmcloud
+          touch -t 197001010000 $BINARY
+          zip -X vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_${{ matrix.os }}_${{ matrix.arch }}.zip $BINARY
+          rm -f $BINARY
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_${{ matrix.os }}_${{ matrix.arch }}.zip
+          path: vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_${{ matrix.os }}_${{ matrix.arch }}.zip
+
+  release:
+    name: Create Release
+    needs: build-matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract Version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Import GPG key
+        run: |
+          echo "$GPG_PRIVATE_KEY_B64" | base64 -d | gpg --batch --import
+        env:
+          GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY_B64 }}
+
+      - name: Generate SHA256SUMS and sign it
+        run: |
+          cd artifacts
+          ls -ltrR .
+          sha256sum * > vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_SHA256SUMS
+          gpg --batch --yes --output vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_SHA256SUMS.sig --detach-sign vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_SHA256SUMS
+
+      - name: Export GPG public key and generate dictionary
+        run: |
+          KEYID=$(gpg --list-keys --with-colons | awk -F: '/^pub/ {print $5; exit}')
+          PUBKEY=$(gpg --armor --export "$KEYID")
+          jq -n --arg key "$KEYID" --arg pubkey "$PUBKEY" '{($key): $pubkey}' > artifacts/vault-plugin-secrets-ibmcloud_${{ env.VERSION }}_GPGKEYS.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**
+          draft: false
+          prerelease: false
+          generate_release_notes: true
